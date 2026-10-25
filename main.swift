@@ -51,8 +51,8 @@ let bolt = NSImage(size: iconSize, flipped: false) { rect in
 }
 bolt.isTemplate = true
 
-// 21 battery glyphs, one per 5 % step (0...100 %).
-let batteries: [NSImage] = (0...20).map { step in
+/// Battery glyph filled to `step` * 5 %; `charging` adds a bolt with a clear halo cut out of the battery.
+func glyph(step: Int, charging: Bool) -> NSImage {
     let image = NSImage(size: iconSize, flipped: false) { _ in
         NSColor.black.set()
         let body = NSBezierPath(roundedRect: NSRect(x: 2.5, y: 3.5, width: 18, height: 9), xRadius: 2.5, yRadius: 2.5)
@@ -64,11 +64,31 @@ let batteries: [NSImage] = (0...20).map { step in
             let radius = min(1.5, fill / 2)
             NSBezierPath(roundedRect: NSRect(x: 4, y: 5, width: fill, height: 6), xRadius: radius, yRadius: radius).fill()
         }
+        if charging {
+            func point(_ u: CGFloat, _ v: CGFloat) -> NSPoint { NSPoint(x: 8 + u * 7, y: 1.5 + v * 13) }
+            let bolt = NSBezierPath()
+            bolt.move(to: point(0.65, 1))
+            bolt.line(to: point(0, 0.38))
+            bolt.line(to: point(0.38, 0.38))
+            bolt.line(to: point(0.28, 0))
+            bolt.line(to: point(1, 0.62))
+            bolt.line(to: point(0.62, 0.62))
+            bolt.close()
+            bolt.lineWidth = 2.4
+            bolt.lineJoinStyle = .round
+            NSGraphicsContext.current?.compositingOperation = .clear
+            bolt.stroke()
+            NSGraphicsContext.current?.compositingOperation = .sourceOver
+            bolt.fill()
+        }
         return true
     }
     image.isTemplate = true
     return image
 }
+
+// 0...20 discharging, then 21...41 on power (charging variant), one per 5 % step.
+let glyphs = (0...20).map { glyph(step: $0, charging: false) } + (0...20).map { glyph(step: $0, charging: true) }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
@@ -88,6 +108,8 @@ item.menu = menu
 
 var last = ""
 var lastIcon = -2
+var tick = 0
+var step = 0
 let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
     let mW = milliwatts()
     let watts = Int((Double(abs(mW)) / 1000).rounded())
@@ -99,11 +121,16 @@ let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
         last = text
         button.title = text
     }
-    // Bolt while running from power; battery in 5 % steps while it is being drained.
-    let icon = sign == "-" ? min(20, max(0, Int((Double(chargePercent()) / 5).rounded()))) : -1
+    // Battery in 5 % steps (bolt cut out of it while on power); bare bolt on Macs without a battery.
+    // The charge only moves slowly, so it is re-read every 5 s.
+    if hasBattery {
+        if tick % 10 == 0 { step = min(20, max(0, Int((Double(chargePercent()) / 5).rounded()))) }
+        tick += 1
+    }
+    let icon = hasBattery ? (sign == "-" ? 0 : 21) + step : -1
     if icon != lastIcon {
         lastIcon = icon
-        button.image = icon < 0 ? bolt : batteries[icon]
+        button.image = icon < 0 ? bolt : glyphs[icon]
     }
 }
 timer.tolerance = 0.1
