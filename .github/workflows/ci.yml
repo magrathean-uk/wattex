@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Compile and inspect only. Hosted runners are VMs with no battery or SMC power keys,
+  # so the app itself is never run here.
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: ./build.sh
+      - name: Inspect bundle
+        run: |
+          plutil -lint Info.plist
+          codesign --verify --strict wattex.app
+          vtool -show-build wattex.app/Contents/MacOS/wattex | grep -q 'minos 13.0'
+          lipo -archs wattex.app/Contents/MacOS/wattex | grep -qx arm64
