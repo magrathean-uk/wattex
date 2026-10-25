@@ -1,43 +1,72 @@
 import AppKit
 import IOKit
+import IOKit.ps
+import ServiceManagement
+
+#if !arch(arm64)
+#error("wattex relies on Apple Silicon SMC data (little-endian si32/flt keys, CurrentCapacity as a percentage); Intel is not supported")
+#endif
 
 // SMC key B0AP: signed battery power in mW (+charging, -discharging), refreshed ~1 Hz.
 // The AppleSmartBattery registry is only refreshed every ~20 s, so it is not used for power.
 // Macs without a battery have no B0AP; they fall back to PSTR (system total power, float watts).
 var smc: io_connect_t = 0
-IOServiceOpen(IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC")), mach_task_self_, 0, &smc)
+let smcService = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+let smcOK = smcService != 0 && IOServiceOpen(smcService, mach_task_self_, 0, &smc) == KERN_SUCCESS
+IOObjectRelease(smcService)
 
 let input = UnsafeMutableRawPointer.allocate(byteCount: 80, alignment: 8)
 let output = UnsafeMutableRawPointer.allocate(byteCount: 80, alignment: 8)
 input.initializeMemory(as: UInt8.self, repeating: 0, count: 80)
+output.initializeMemory(as: UInt8.self, repeating: 0, count: 80)
 input.storeBytes(of: 4, toByteOffset: 28, as: UInt32.self)      // key data size
-input.storeBytes(of: 5, toByteOffset: 42, as: UInt8.self)       // command: read bytes
 
-/// Raw 4-byte value of an SMC key, or nil if the key does not exist.
-func read(_ key: UInt32) -> UInt32? {
+/// One SMC call: command 9 = key info, 5 = read bytes. False if it fails or the key does not exist.
+func call(_ key: UInt32, command: UInt8) -> Bool {
     input.storeBytes(of: key, as: UInt32.self)
+    input.storeBytes(of: command, toByteOffset: 42, as: UInt8.self)
     var size = 80
-    guard IOConnectCallStructMethod(smc, 2, input, 80, output, &size) == kIOReturnSuccess,
-          output.load(fromByteOffset: 40, as: UInt8.self) == 0 else { return nil }
-    return output.load(fromByteOffset: 48, as: UInt32.self)
+    return IOConnectCallStructMethod(smc, 2, input, 80, output, &size) == kIOReturnSuccess
+        && size == 80 && output.load(fromByteOffset: 40, as: UInt8.self) == 0
+}
+
+/// Raw 4-byte value of an SMC key, or nil if the call fails.
+func read(_ key: UInt32) -> UInt32? {
+    call(key, command: 5) ? output.load(fromByteOffset: 48, as: UInt32.self) : nil
+}
+
+/// True if the key exists and is 4 bytes of the given type (a shorter key would be read with zero padding).
+func has(_ key: UInt32, type: UInt32) -> Bool {
+    call(key, command: 9)
+        && output.load(fromByteOffset: 28, as: UInt32.self) == 4
+        && output.load(fromByteOffset: 32, as: UInt32.self) == type
 }
 
 let b0ap: UInt32 = 0x4230_4150  // 'B0AP'
 let pstr: UInt32 = 0x5053_5452  // 'PSTR'
-let hasBattery = read(b0ap) != nil
-
-func milliwatts() -> Int {
-    if hasBattery { return Int(Int32(bitPattern: read(b0ap) ?? 0)) }
-    let watts = Float(bitPattern: read(pstr) ?? 0)
-    return watts.isFinite ? Int(watts * 1000) : 0
-}
+let si32: UInt32 = 0x7369_3332  // 'si32'
+let flt: UInt32 = 0x666C_7420   // 'flt '
 
 // CurrentCapacity is a percentage on Apple Silicon (MaxCapacity is 100).
 let battery = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+let hasBattery = smcOK && battery != 0 && has(b0ap, type: si32)
+let hasPower = hasBattery || (smcOK && has(pstr, type: flt))
 
-func chargePercent() -> Int {
+/// Signed milliwatts clamped to +-999 W (so garbage can neither trap nor overflow the 3-digit layout), or nil.
+func milliwatts() -> Int? {
+    guard hasPower, let raw = read(hasBattery ? b0ap : pstr) else { return nil }
+    let value = hasBattery ? Double(Int32(bitPattern: raw)) : Double(Float(bitPattern: raw)) * 1000
+    return value.isFinite ? Int(max(-999_000, min(999_000, value))) : nil
+}
+
+func chargePercent() -> Int? {
     let value = IORegistryEntryCreateCFProperty(battery, "CurrentCapacity" as CFString, kCFAllocatorDefault, 0)
-    return (value?.takeRetainedValue() as? NSNumber)?.intValue ?? 0
+    return (value?.takeRetainedValue() as? NSNumber)?.intValue
+}
+
+/// True while a charger is connected, whichever way the battery power is flowing.
+func onACPower() -> Bool {
+    IOPSGetProvidingPowerSourceType(nil)?.takeUnretainedValue() as String? == kIOPSACPowerValue
 }
 
 // Template icons, all the same size so the item width never changes.
@@ -93,6 +122,17 @@ let glyphs = (0...20).map { glyph(step: $0, charging: false) } + (0...20).map { 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
+// Start at login: registered once, on the first successful launch. If it is later switched off in
+// Login Items it stays off, because the flag is already set.
+if !UserDefaults.standard.bool(forKey: "loginItemRegistered") {
+    do {
+        try SMAppService.mainApp.register()
+        UserDefaults.standard.set(true, forKey: "loginItemRegistered")
+    } catch {
+        fputs("wattex: could not register login item: \(error)\n", stderr)
+    }
+}
+
 // Fixed width sized for the widest text ("888W+") and a monospaced font.
 let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 let button = item.button!
@@ -111,7 +151,7 @@ var lastIcon = -2
 var tick = 0
 var step = 0
 let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
-    let mW = milliwatts()
+    guard let mW = milliwatts() else { button.title = "  ?W "; return }
     let watts = Int((Double(abs(mW)) / 1000).rounded())
     let digits = String(watts)
     let sign = watts == 0 || !hasBattery ? " " : (mW > 0 ? "+" : "-")
@@ -121,13 +161,13 @@ let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
         last = text
         button.title = text
     }
-    // Battery in 5 % steps (bolt cut out of it while on power); bare bolt on Macs without a battery.
+    // Battery in 5 % steps (bolt cut out of it while a charger is connected); bare bolt without a battery.
     // The charge only moves slowly, so it is re-read every 5 s.
     if hasBattery {
-        if tick % 10 == 0 { step = min(20, max(0, Int((Double(chargePercent()) / 5).rounded()))) }
+        if tick % 10 == 0, let percent = chargePercent() { step = min(20, max(0, Int((Double(percent) / 5).rounded()))) }
         tick += 1
     }
-    let icon = hasBattery ? (sign == "-" ? 0 : 21) + step : -1
+    let icon = hasBattery ? (onACPower() ? 21 : 0) + step : -1
     if icon != lastIcon {
         lastIcon = icon
         button.image = icon < 0 ? bolt : glyphs[icon]
